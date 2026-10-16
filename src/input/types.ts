@@ -56,7 +56,7 @@ export const SURFACE_LABELS: Record<ControlSurface, string> = {
 };
 
 /** What kind of physical input a binding refers to. */
-export type BindingKind = 'axis' | 'button' | 'key' | 'touchZone';
+export type BindingKind = 'axis' | 'button' | 'key' | 'touchZone' | 'channel';
 
 export interface Binding {
   kind: BindingKind;

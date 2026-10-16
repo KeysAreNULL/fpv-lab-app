@@ -15,7 +15,7 @@
     "check": "npm run typecheck && npm run lint && npm run test",
     "cap:sync": "npm run build && cap sync",
     "android:sync": "npm run build && cap sync android",
-    "android:apk": "npm run android:sync && cd android && gradlew assembleDebug",
+    "android:apk": "npm run android:sync && node scripts/android-apk.mjs",
     "android:run": "npm run android:sync && cap run android",
     "icons": "node scripts/gen-assets.mjs"
   },

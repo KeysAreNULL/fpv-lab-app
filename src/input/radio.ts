@@ -30,10 +30,35 @@ import {
 /** Microsecond channel values for full deflection. */
 const CH_MIN = 885;
 const CH_MAX = 1215;
-const CH_CENTRE = 1050;
+/** Centre of a channel's travel. Two-position switches change over this. */
+export const CH_CENTRE = 1050;
 
 /** Frame length for a 16-channel ELRS joystick frame. */
 const FRAME_LENGTH = 32;
+
+/**
+ * Channel names in AETR order. The first four are the flight channels; the rest
+ * are the aux slots the default switch mapping draws from. Used by the mapping
+ * UI so a binding reads "CH3 Throttle" rather than "channel 2".
+ */
+const CHANNEL_NAMES = [
+  'Roll',
+  'Pitch',
+  'Throttle',
+  'Yaw',
+  'Aux 1',
+  'Aux 2',
+  'Aux 3',
+  'Aux 4',
+  'Aux 5',
+  'Aux 6',
+  'Aux 7',
+  'Aux 8',
+  'Aux 9',
+  'Aux 10',
+  'Aux 11',
+  'Aux 12',
+] as const;
 
 export type RadioProtocol = 'expresslrs' | 'crossfire' | 'unknown';
 
@@ -174,8 +199,9 @@ export class RadioDriver implements InputDriver {
     const raw = this.latest;
     if (!raw || raw.channels.length < 4) return null;
 
-    // AETR: throttle, roll, pitch, yaw, then the switches on 5–8.
-    const [throttleCh, rollCh, pitchCh, yawCh] = raw.channels;
+    // AETR: ch1 aileron (roll), ch2 elevator (pitch), ch3 throttle, ch4 rudder
+    // (yaw), then the switches on 5–12.
+    const [rollCh, pitchCh, throttleCh, yawCh] = raw.channels;
     const buttons = new Set<string>();
     const addSwitch = (index: number, name: string): void => {
       if ((raw.channels[index] ?? CH_MIN) > CH_CENTRE) buttons.add(name);
@@ -190,12 +216,17 @@ export class RadioDriver implements InputDriver {
     addSwitch(11, 'videoRecord');
 
     return {
-      // Channel microseconds → signed gimbal positions.
-      leftX: channelToSigned(rollCh),
-      leftY: channelToSigned(pitchCh),
-      rightX: channelToSigned(yawCh),
-      // Gimbal Y is up-positive, so the throttle channel maps directly.
-      rightY: channelToSigned(throttleCh),
+      // Channel microseconds → physical gimbal positions.
+      //
+      // A transmitter's gimbal layout is Mode 2 by construction: the left stick
+      // is yaw/throttle and the right stick is roll/pitch. Handing over *gimbals*
+      // (not channels) is what lets `mapping.ts` translate modes 1–4 in one
+      // place — placing channels on gimbals here as well would apply the mode
+      // twice and scramble every axis.
+      leftX: channelToSigned(yawCh),
+      leftY: channelToSigned(throttleCh),
+      rightX: channelToSigned(rollCh),
+      rightY: channelToSigned(pitchCh),
       buttons,
     };
   }
@@ -203,6 +234,23 @@ export class RadioDriver implements InputDriver {
   /** Latest reported link quality, 0..100, for the radio readout. */
   get linkQuality(): number | undefined {
     return this.latest?.lq;
+  }
+
+  /**
+   * Latest decoded channels in microseconds, AETR order.
+   *
+   * Exposed so the mapping UI can capture which channel moved and the manager
+   * can resolve explicit bindings. Empty until a frame arrives, which is what
+   * makes a radio binding inert on any other device.
+   */
+  get channels(): readonly number[] {
+    return this.latest?.channels ?? [];
+  }
+
+  /** Human-readable channel name for the mapping UI, e.g. "CH3 Throttle". */
+  channelLabel(index: number): string {
+    const name = CHANNEL_NAMES[index];
+    return `CH${index + 1}${name ? ` ${name}` : ''}`;
   }
 
   get transportKind(): 'serial' | 'hid' | null {
@@ -220,6 +268,9 @@ export function channelToSigned(microseconds: number): number {
   return clamp((microseconds - CH_CENTRE) / ((CH_MAX - CH_MIN) / 2), -1, 1);
 }
 
+/** Whether a two-position switch channel is in its upper position. */
+export const channelIsHigh = (microseconds: number): boolean => microseconds > CH_CENTRE;
+
 /** Signed value → microseconds, for the on-screen radio emulator. */
 export const signedToChannel = (value: number): number =>
   CH_CENTRE + clamp(value, -1, 1) * ((CH_MAX - CH_MIN) / 2);
@@ -236,10 +287,12 @@ export function decodeElrsFrame(bytes: Uint8Array): RadioFrame | null {
   if (bytes.length < FRAME_LENGTH) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const channels: number[] = [];
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < FRAME_LENGTH / 2; i++) {
     const value = view.getUint16(i * 2, false);
-    // Out of the PPM range entirely means this is not a channel frame.
-    if (value < 700 || value > 1500) return null;
+    // Only the four flight channels are validated hard. Auxiliary slots and any
+    // trailing telemetry can carry non-microsecond values, and throwing the
+    // whole frame away over one of those loses otherwise good stick data.
+    if (i < 4 && (value < 700 || value > 1500)) return null;
     channels.push(value);
   }
   return { channels, protocol: 'expresslrs' };

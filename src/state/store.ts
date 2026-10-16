@@ -420,6 +420,9 @@ export const actions = {
   assignBinding(surface: PartSlot | ControlSurface, binding: Binding): void {
     const bindings = { ...get().bindings };
     bindings[surface as ControlSurface] = binding;
+    // The manager holds the live copy it reads each poll; the store copy is only
+    // what the panel renders.
+    get().input.setBindings(bindings);
     useStore.setState({ bindings });
     notify(`${SURFACE_LABELS[surface as ControlSurface]} bound`, 'good');
   },
@@ -427,10 +430,12 @@ export const actions = {
   clearBinding(surface: ControlSurface): void {
     const bindings = { ...get().bindings };
     delete bindings[surface];
+    get().input.setBindings(bindings);
     useStore.setState({ bindings });
   },
 
   resetBindings(): void {
+    get().input.setBindings({});
     useStore.setState({ bindings: {} });
     notify('Control bindings cleared');
   },
