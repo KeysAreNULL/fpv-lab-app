@@ -6,12 +6,18 @@ committing it, so the Gradle version never has to be merged by hand.
 ## Prerequisites
 
 1. **Node 20+**
-2. **JDK 17** — `java -version` should report 17. Set `JAVA_HOME`.
+2. **JDK 17** — `java -version` must report 17 or newer. Set `JAVA_HOME` to point
+   at it. An old JDK 8 on `PATH` will fail the Gradle build with a confusing error.
+   Android Studio ships a suitable JDK; on Windows that is usually
+   `C:\Program Files\Android\Android Studio\jbr`.
 3. **Android Studio** (recommended) or the standalone **Android SDK**:
    - Android SDK Platform 34
    - Android SDK Build-Tools 34.0.0
    - Android SDK Platform-Tools (for `adb`)
    - `ANDROID_HOME` pointing at the SDK, and `sdk\cmdline-tools\latest\bin` on `PATH`.
+
+Verified build: `dev.fpvlab.app`, minSdk 22 (Android 5.1+), targetSdk 34,
+**3.8 MB** debug APK.
 
 ## Build an APK
 
@@ -23,6 +29,16 @@ npm run android:apk      # debug APK → android/app/build/outputs/apk/debug/
 The APK lands at `android/app/build/outputs/apk/debug/app-debug.apk`. Install it
 with `adb install -r <path>` or by copying it to the phone and tapping it (you
 will need to allow installs from unknown sources once).
+
+### The Android project is generated, not committed
+
+`android/` is gitignored. On a fresh clone run `npx cap add android` once, then
+`npm run android:sync` will keep it up to date. If you change the app id or
+Capacitor plugins, update `capacitor.config.ts` and re-add the platform rather
+than editing Gradle files by hand.
+
+If Gradle fails with "Unsupported class file major version" or a JVM target
+error, you are on the wrong JDK — check `java -version` reports 17+.
 
 ## Release build
 
