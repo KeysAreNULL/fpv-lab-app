@@ -1,11 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { CONTROL_SURFACES, SURFACE_LABELS, type ControlSurface } from '../../input/types';
+import {
+  CONTROL_SURFACES,
+  SURFACE_LABELS,
+  type Binding,
+  type ControlSurface,
+} from '../../input/types';
 import { STICK_MODE_LABELS, type StickAxis } from '../../input/mapping';
-import { RadioDriver } from '../../input/radio';
+import { CH_CENTRE, RadioDriver } from '../../input/radio';
+import { isTransmitter } from '../../input/gamepad';
 import { actions, useStore } from '../../state/store';
 import { Card, PanelHead, Select, Stat, Switch } from '../components';
 
 const AXES: StickAxis[] = ['roll', 'pitch', 'yaw', 'throttle'];
+
+/** How many channels the raw monitor shows. */
+const CHANNEL_MONITOR_COUNT = 12;
 
 const STICK_MODE_OPTIONS = ([1, 2, 3, 4] as const).map((mode) => ({
   value: String(mode) as '1' | '2' | '3' | '4',
@@ -29,7 +38,13 @@ export function ControlsPanel(): JSX.Element {
   const bindings = useStore((s) => s.bindings);
   const [listening, setListening] = useState<ControlSurface | null>(null);
   const [live, setLive] = useState<Record<string, number>>({});
-  const rafRef = useRef(0);
+  const [channels, setChannels] = useState<number[]>([]);
+  const [pads, setPads] = useState<{ id: string; transmitter: boolean; axes: number[] }[]>([]);
+  // Separate handles per effect. Sharing one ref meant each effect's cleanup
+  // cancelled the *other* effect's pending frame, so finishing a rebind killed
+  // the live readout loop and the panel froze — reading as "rebinding broke".
+  const listenRaf = useRef(0);
+  const liveRaf = useRef(0);
 
   const settings = input?.settings;
 
@@ -37,6 +52,9 @@ export function ControlsPanel(): JSX.Element {
    * While "listen" is on, poll the raw device and record which control moved
    * most from where it started. A short settle delay stops a drifting gimbal
    * from capturing the wrong thing.
+   *
+   * A controller is checked first, then the radio's channels, so a transmitter
+   * is rebound exactly the way a gamepad is.
    */
   useEffect(() => {
     if (!listening || !input) return undefined;
@@ -70,16 +88,42 @@ export function ControlsPanel(): JSX.Element {
           return;
         }
         if (++settled > 20) baseline = values;
+        listenRaf.current = requestAnimationFrame(tick);
+        return;
       }
-      rafRef.current = requestAnimationFrame(tick);
+
+      // No controller: capture from the transmitter instead. Thresholds are in
+      // microseconds, so a switch throw counts the same as a stick sweep.
+      const live = input.radio.channels;
+      if (live.length >= 4) {
+        const values = [...live];
+        if (baseline === null) baseline = values;
+        let bestIndex = -1;
+        let bestDelta = 120;
+        values.forEach((value, index) => {
+          const delta = Math.abs(value - (baseline?.[index] ?? CH_CENTRE));
+          if (delta > bestDelta) {
+            bestDelta = delta;
+            bestIndex = index;
+          }
+        });
+        if (bestIndex >= 0) {
+          actions.assignBinding(listening, { kind: 'channel', id: bestIndex });
+          setListening(null);
+          return;
+        }
+        if (++settled > 20) baseline = values;
+      }
+      listenRaf.current = requestAnimationFrame(tick);
     };
-    rafRef.current = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(rafRef.current);
+    listenRaf.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(listenRaf.current);
   }, [listening, input]);
 
   /** Live values for the readout, polled at the UI rate only. */
   useEffect(() => {
     let last = performance.now();
+    let channelTick = 0;
     const tick = (now: number): void => {
       const dt = Math.min((now - last) / 1000, 0.1);
       last = now;
@@ -95,14 +139,41 @@ export function ControlsPanel(): JSX.Element {
           ),
         }));
       }
-      rafRef.current = requestAnimationFrame(tick);
+      // Raw channel monitor, deliberately slower than the readout: this is a
+      // diagnostic, and a pilot needs to see which channel is moving to tell a
+      // dead link from a wrong channel order.
+      if (now - channelTick > 100) {
+        channelTick = now;
+        setChannels([...(input?.radio.channels ?? [])].slice(0, CHANNEL_MONITOR_COUNT));
+        // A radio in USB Joystick mode enumerates as a HID joystick and shows
+        // up here rather than as a serial port, so list what the browser can
+        // actually see.
+        setPads(
+          (navigator.getGamepads?.() ?? [])
+            .filter((p): p is Gamepad => p !== null)
+            .map((p) => ({ id: p.id, transmitter: isTransmitter(p.id), axes: Array.from(p.axes) })),
+        );
+      }
+      liveRaf.current = requestAnimationFrame(tick);
     };
-    rafRef.current = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(rafRef.current);
+    liveRaf.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(liveRaf.current);
   }, [input]);
 
   const readValue = useCallback((surface: ControlSurface): number => live[surface] ?? 0, [live]);
   const calibration = settings?.calibration;
+
+  /** "CH3 Throttle" for a radio binding, "axis 2" for a controller one. */
+  const describeBinding = useCallback(
+    (binding: Binding | undefined): string => {
+      if (!binding) return 'default — press Listen and move the control';
+      if (binding.kind === 'channel') return input?.radio.channelLabel(Number(binding.id)) ?? '—';
+      return `${binding.kind} ${binding.id}`;
+    },
+    [input],
+  );
+
+  const boundCount = Object.keys(bindings).length;
 
   return (
     <div className="panel wide">
@@ -173,6 +244,16 @@ export function ControlsPanel(): JSX.Element {
       </div>
 
       <Card title="Control surfaces">
+        <div className="row" style={{ marginBottom: 8, justifyContent: 'space-between' }}>
+          <span className="switch-desc">
+            Listen captures from{' '}
+            {device.kind === 'radio' ? 'the transmitter' : `the ${device.kind}`}. Bound
+            channels override stick mode for that surface only.
+          </span>
+          <button className="btn small" disabled={boundCount === 0} onClick={actions.resetBindings}>
+            Reset all
+          </button>
+        </div>
         <div className="part-list" style={{ maxHeight: 'none' }}>
           {CONTROL_SURFACES.map((surface) => {
             const isAxis =
@@ -204,6 +285,16 @@ export function ControlsPanel(): JSX.Element {
                   >
                     {listening === surface ? 'Move it…' : 'Listen'}
                   </button>
+                  {binding ? (
+                    <button
+                      className="btn small"
+                      style={{ minHeight: 30 }}
+                      aria-label={`Clear binding for ${SURFACE_LABELS[surface]}`}
+                      onClick={() => actions.clearBinding(surface)}
+                    >
+                      Clear
+                    </button>
+                  ) : null}
                 </span>
                 <span className="part-meta">
                   <div className="bar">
@@ -214,12 +305,70 @@ export function ControlsPanel(): JSX.Element {
                       }}
                     />
                   </div>
-                  {binding ? `bound: ${binding.kind} ${binding.id}` : 'default — press Listen and move the control'}
+                  {describeBinding(binding)}
                 </span>
               </div>
             );
           })}
         </div>
+      </Card>
+
+      <Card title="Radio link">
+        <div className="switch-desc" style={{ marginBottom: 6 }}>
+          A transmitter in USB <strong>Joystick</strong> mode is not a serial
+          port — the browser sees it as a controller below, and no "Connect" is
+          needed. <strong>Serial</strong> mode uses the Connect button instead.
+        </div>
+        <div className="stat-grid" style={{ marginBottom: 8 }}>
+          <Stat label="Controllers seen" value={String(pads.length)} tone={pads.length ? 'good' : 'warn'} />
+        </div>
+        {pads.length === 0 ? (
+          <span className="part-meta">
+            No controllers detected — the transmitter is not enumerating, or the
+            browser is holding it.
+          </span>
+        ) : (
+          pads.map((pad) => (
+            <div key={pad.id} style={{ marginBottom: 8 }}>
+              <div className="part-name">{pad.id}</div>
+              <span className="part-meta">
+                {pad.transmitter
+                  ? 'Detected as a transmitter. Move one gimbal at a time and check which axis moves — then Listen on that surface to bind it.'
+                  : 'Detected as a generic controller.'}
+              </span>
+              <div className="stat-grid" style={{ marginTop: 4 }}>
+                {pad.axes.map((value, index) => (
+                  <Stat
+                    key={index}
+                    label={`Axis ${index}`}
+                    value={value.toFixed(2)}
+                    tone={Math.abs(value) > 0.15 ? 'good' : undefined}
+                  />
+                ))}
+              </div>
+            </div>
+          ))
+        )}
+        {channels.length === 0 ? (
+          <span className="part-meta">No serial channel data.</span>
+        ) : (
+          <div className="stat-grid">
+            {channels.map((value, index) => (
+              <Stat
+                key={index}
+                label={input?.radio.channelLabel(index) ?? `CH${index + 1}`}
+                value={`${Math.round(value)}`}
+                tone={
+                  Math.abs(value - CH_CENTRE) < 15
+                    ? undefined
+                    : value > CH_CENTRE
+                      ? 'good'
+                      : 'warn'
+                }
+              />
+            ))}
+          </div>
+        )}
       </Card>
 
       <div className="stat-grid" style={{ marginTop: 10 }}>

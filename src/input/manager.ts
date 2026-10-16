@@ -22,6 +22,8 @@ import {
 } from './mapping';
 import {
   NEUTRAL_FRAME,
+  SWITCH_SURFACES,
+  type Binding,
   type ControlSurface,
   type InputDeviceInfo,
   type InputDriver,
@@ -29,7 +31,7 @@ import {
   type StickMode,
 } from './types';
 import { GamepadDriver } from './gamepad';
-import { RadioDriver } from './radio';
+import { RadioDriver, channelToSigned } from './radio';
 import { KeyboardDriver, TouchDriver } from './touch';
 
 export type DriverKind = 'gamepad' | 'radio' | 'touch' | 'keyboard';
@@ -43,6 +45,11 @@ export interface InputConfig {
   autoDisarmOnFailsafe: boolean;
   /** Preferred driver; falls back automatically if it is unavailable. */
   preferred: DriverKind;
+  /**
+   * Explicit per-surface overrides from the controls panel. A surface with a
+   * binding ignores the stick mode; unbound surfaces keep the default layout.
+   */
+  bindings: Partial<Record<ControlSurface, Binding>>;
 }
 
 export const DEFAULT_INPUT_CONFIG: InputConfig = {
@@ -51,6 +58,7 @@ export const DEFAULT_INPUT_CONFIG: InputConfig = {
   gestureArm: true,
   autoDisarmOnFailsafe: true,
   preferred: 'gamepad',
+  bindings: {},
 };
 
 export class InputManager {
@@ -113,6 +121,60 @@ export class InputManager {
     (this.drivers.get('keyboard') as KeyboardDriver).setStickMode(this.config.stickMode);
   }
 
+  /** Replace the explicit bindings captured by the controls panel. */
+  setBindings(bindings: InputConfig['bindings']): void {
+    this.config = { ...this.config, bindings: { ...bindings } };
+  }
+
+  /**
+   * Radio channels in microseconds, or empty when the radio is not the active
+   * driver.
+   *
+   * Gating on the active driver matters: a binding captured on the transmitter
+   * must go inert when the pilot switches to a gamepad, rather than quietly
+   * feeding radio numbers into the controller.
+   */
+  private radioChannels(): readonly number[] {
+    if (this.active !== 'radio') return [];
+    return (this.drivers.get('radio') as RadioDriver).channels;
+  }
+
+  /**
+   * Raw value for a binding from whichever driver owns that kind of control.
+   *
+   * Returns null when the binding does not apply to the active device, so the
+   * caller falls back to the stick-mode default instead of feeding in zeros.
+   */
+  private readBindingValue(binding: Binding): number | null {
+    if (binding.kind === 'channel') {
+      const channel = this.radioChannels()[binding.id as number];
+      return channel === undefined ? null : channelToSigned(channel);
+    }
+    if (binding.kind === 'axis' || binding.kind === 'button') {
+      if (this.active !== 'gamepad') return null;
+      return (this.drivers.get('gamepad') as GamepadDriver).readBoundValue(binding);
+    }
+    return null;
+  }
+
+  /**
+   * Value for one flight axis. An explicit binding wins over the stick mode, so
+   * a pilot can use any transmitter layout the stick modes don't cover — and
+   * correct a layout we guessed wrong, since Listen binds whatever actually
+   * moved. Sign is left to the per-axis Reverse toggle in calibration.
+   */
+  private boundAxis(
+    surface: 'roll' | 'pitch' | 'yaw' | 'throttle',
+    fallback: number,
+  ): number {
+    const binding = this.config.bindings[surface];
+    if (!binding) return fallback;
+    const raw = this.readBindingValue(binding);
+    if (raw === null) return fallback;
+    // Throttle is a 0..1 demand; the rest are signed rate demands.
+    return surface === 'throttle' ? clamp((raw + 1) / 2, 0, 1) : clamp(raw, -1, 1);
+  }
+
   get settings(): InputConfig {
     return this.config;
   }
@@ -144,14 +206,20 @@ export class InputManager {
    * button and the space bar work no matter which device has the sticks.
    */
   poll(dt: number, time: number): InputFrame {
-    // Hot-plug: a controller appearing takes over from whatever was active,
-    // because a pilot who just plugged in a pad expects it to work immediately.
-    if (this.active !== 'gamepad' && this.drivers.get('gamepad')?.info().connected) {
-      this.select('gamepad');
-    }
-
     const active = this.drivers.get(this.active);
-    const raw = active?.poll() ?? null;
+    let raw = active?.poll() ?? null;
+
+    // Hot-plug: a controller that appears takes over from an idle device,
+    // because a pilot who just plugged in a pad expects it to work immediately.
+    //
+    // It must only take over from a driver that is producing nothing. An
+    // unconditional promotion stomped a radio the pilot had deliberately
+    // connected, and since radio bindings only resolve while the radio is the
+    // active driver, every rebind silently did nothing.
+    if (!raw && this.active !== 'gamepad' && this.drivers.get('gamepad')?.info().connected) {
+      this.select('gamepad');
+      raw = this.drivers.get('gamepad')?.poll() ?? null;
+    }
 
     if (!raw) {
       // No data from the active device: hold the last frame but keep it safe.
@@ -170,12 +238,26 @@ export class InputManager {
     const gimbals = applyStickMode(raw.leftX, raw.leftY, raw.rightX, raw.rightY, mode);
     const cal = this.config.calibration;
 
-    const roll = processAxis('roll', gimbals.roll, cal.roll, this.frame.roll, dt);
-    const pitch = processAxis('pitch', gimbals.pitch, cal.pitch, this.frame.pitch, dt);
-    const yaw = processAxis('yaw', gimbals.yaw, cal.yaw, this.frame.yaw, dt);
-    const throttle = processAxis('throttle', gimbals.throttle, cal.throttle, this.frame.throttle, dt);
+    const roll = processAxis('roll', this.boundAxis('roll', gimbals.roll), cal.roll, this.frame.roll, dt);
+    const pitch = processAxis('pitch', this.boundAxis('pitch', gimbals.pitch), cal.pitch, this.frame.pitch, dt);
+    const yaw = processAxis('yaw', this.boundAxis('yaw', gimbals.yaw), cal.yaw, this.frame.yaw, dt);
+    const throttle = processAxis(
+      'throttle',
+      this.boundAxis('throttle', gimbals.throttle),
+      cal.throttle,
+      this.frame.throttle,
+      dt,
+    );
 
     const switches = switchesFromButtons(raw.buttons);
+    // A switch bound to a control follows that control instead of the default
+    // position the driver assumed.
+    for (const surface of SWITCH_SURFACES) {
+      const binding = this.config.bindings[surface];
+      if (!binding) continue;
+      const value = this.readBindingValue(binding);
+      if (value !== null) switches[surface] = value > 0.5;
+    }
     // Throttle/yaw arming gesture, on top of whatever switch is mapped.
     if (this.config.gestureArm) {
       if (updateArmGesture(this.gesture, throttle, yaw, time)) switches.armSwitch = true;
